@@ -8,6 +8,5 @@ ATTACK_TYPE = "attack"
 ATTACK_DATA_ROOT = "/raid/007-Xiangyu-Experiments/selforacle/evaluation_data"
 ATTACK_DATA_TYPE = "CHAUFFEUR-Track1-Snow"
 ATTACKED_DATA = "/raid/007-Xiangyu-Experiments/selforacle/evaluation/spsa_attack/epoch"
-THRESHOLD_ROOT = "/raid/007-Xiangyu-Experiments/selforacle/A-Unified-Benchmark-for-Out-of-Distribution-Detection-for-Autonomous-Driving-Systems/Detectors/VAE/thresholds"
+THRESHOLD_ROOT = "/raid/007-Xiangyu-Experiments/selforacle/A-Unified-Benchmark-for-Out-of-Distribution-Detection-for-Autonomous-Driving-Systems/Detectors/GMM/thresholds"
 THRESHOLD_RANGE  = [70,80,90,95,99]  # threshold to be used for evaluation
-MODEL_PATH = "/raid/007-Xiangyu-Experiments/selforacle/A-Unified-Benchmark-for-Out-of-Distribution-Detection-for-Autonomous-Driving-Systems/Detectors/VAE/weights/best_vae.pth"

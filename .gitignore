@@ -1,3 +1,6 @@
 *.pkl
 *.pth
 *.pyc
+*.log
+
+__pycache__/

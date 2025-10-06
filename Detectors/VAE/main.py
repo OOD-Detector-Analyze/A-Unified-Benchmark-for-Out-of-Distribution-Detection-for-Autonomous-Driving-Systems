@@ -17,11 +17,87 @@ import matplotlib.pyplot as plt
 from Detectors.utils import calc_and_store_thresholds
 import joblib
 import time
-from Detectors.SAE.config import *
+from Detectors.VAE.config import *
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 import swanlab 
 
+class VAE(nn.Module):
+    def __init__(self, latent_dim=128):
+        super(VAE, self).__init__()
+        self.latent_dim = latent_dim
 
+        self.encoder = nn.Sequential(
+            nn.Conv2d(3, 32, 4, stride=2, padding=1),  # [B, 32, 80, 160]
+            nn.ReLU(),
+            nn.Conv2d(32, 64, 4, stride=2, padding=1),  # [B, 64, 40, 80]
+            nn.ReLU(),
+            nn.Conv2d(64, 128, 4, stride=2, padding=1),  # [B, 128, 20, 40]
+            nn.ReLU()
+        )
+        self.flatten = nn.Flatten()
+        self.fc_mu = nn.Linear(128 * 20 * 40, latent_dim)
+        self.fc_logvar = nn.Linear(128 * 20 * 40, latent_dim)
+
+        self.decoder_input = nn.Linear(latent_dim, 128 * 20 * 40)
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(128, 64, 4, stride=2, padding=1),  # [B, 64, 40, 80]
+            nn.ReLU(),
+            nn.ConvTranspose2d(64, 32, 4, stride=2, padding=1),  # [B, 32, 80, 160]
+            nn.ReLU(),
+            nn.ConvTranspose2d(32, 3, 4, stride=2, padding=1),  # [B, 3, 160, 320]
+            nn.Sigmoid()
+        )
+
+    def encode(self, x):
+        x = self.encoder(x)
+        x = self.flatten(x)
+        mu = self.fc_mu(x)
+        logvar = self.fc_logvar(x)
+        return mu, logvar
+
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    def decode(self, z):
+        x = self.decoder_input(z).view(-1, 128, 20, 40)
+        return self.decoder(x)
+
+    def forward(self, x):
+        mu, logvar = self.encode(x)
+        z = self.reparameterize(mu, logvar)
+        x_recon = self.decode(z)
+        return x_recon, mu, logvar
+
+
+def vae_loss_per_sample(recon_x, x, mu, logvar, beta=1.0):
+    # MSE per sample
+    recon_loss = F.mse_loss(recon_x, x, reduction='none')
+    recon_loss = recon_loss.view(recon_loss.size(0), -1).mean(dim=1)  # [B]
+
+    # KL divergence per sample
+    kl_div = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1) / x[0].numel()  # [B]
+
+    return recon_loss + beta * kl_div  # shape [B]
+
+
+def vae_samplewise_loss(x, x_recon, mu, logvar):
+    """
+    Computes the VAE loss per sample:
+    - reconstruction loss (MSE)
+    - KL divergence
+    Returns: tensor of shape (batch_size,)
+    """
+    # Reconstruction loss (MSE per pixel, summed per sample)
+    recon_loss = F.mse_loss(x_recon, x, reduction='none')  # shape: [B, C, H, W]
+    recon_loss = recon_loss.view(x.size(0), -1).sum(dim=1)  # shape: [B]
+
+    # KL divergence per sample
+    kl_div = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)  # shape: [B]
+
+    # Total loss per sample
+    return recon_loss + kl_div
 
 
 class Autoencoder(nn.Module):
@@ -144,8 +220,8 @@ def train():
 
 
 def get_threshold():
-    model = Autoencoder().to(device)
-    weights = torch.load("/raid/007-Xiangyu-Experiments/selforacle/A-Unified-Benchmark-for-Out-of-Distribution-Detection-for-Autonomous-Driving-Systems/Detectors/SAE/weights/best_sae.pth", weights_only=False)
+    model = VAE(latent_dim=128).to(device)
+    weights = torch.load(MODEL_PATH, weights_only=False)
     model.load_state_dict(weights)
     model.eval()
     transform = transforms.Compose([
@@ -159,29 +235,22 @@ def get_threshold():
     train_size = len(dataset) - val_size
     train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
     criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    optimizer = optim.Adam(model.parameters(), lr=1e-4)
     train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=4)
     val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=4)
     train_losses_for_threshold = []
     train_loss = 0.0
-    for images, label in train_loader:
-        images = images.to(device)
-        outputs = model(images)
-        # Standard training loss
-        loss = criterion(outputs, images)
-        # Per-sample loss for threshold (disable grad)
-        with torch.no_grad():
-            losses = torch.nn.functional.mse_loss(outputs, images, reduction='none')
-            losses = losses.view(losses.size(0), -1).mean(dim=1)
-            train_losses_for_threshold.extend(losses.cpu().numpy())
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+    with torch.no_grad():
+        for images, _ in train_loader:           # label not used
+            images = images.to(device)
+            outputs, mu, logvar = model(images)
+            loss_vec = vae_loss_per_sample(outputs, images, mu, logvar)
+            train_losses_for_threshold.extend(loss_vec.cpu().numpy())
 
-        train_loss += loss.item() * images.size(0)
+    train_losses_for_threshold = np.asarray(train_losses_for_threshold)
     train_loss /= len(train_loader.dataset)
-    threshold_dict = calc_and_store_thresholds(train_losses_for_threshold, "SAE")
-    root = "/raid/007-Xiangyu-Experiments/selforacle/A-Unified-Benchmark-for-Out-of-Distribution-Detection-for-Autonomous-Driving-Systems/Detectors/SAE"
+    threshold_dict = calc_and_store_thresholds(train_losses_for_threshold, "VAE")
+    root = "/raid/007-Xiangyu-Experiments/selforacle/A-Unified-Benchmark-for-Out-of-Distribution-Detection-for-Autonomous-Driving-Systems/Detectors/VAE"
     threshold = threshold_dict["0.7"]
     joblib.dump(threshold, root+"/thresholds/70.pkl")
     threshold = threshold_dict["0.8"]
@@ -193,8 +262,7 @@ def get_threshold():
     threshold = threshold_dict["0.99"]
     joblib.dump(threshold, root+"/thresholds/99.pkl")
 
-
-
+    
 
 def eval():
     swanlab.init(
@@ -202,14 +270,14 @@ def eval():
         project="OODDetector",
         workspace="sumail",
         # 跟踪超参数和运行元数据
-        experiment_name = f"SAE_{TYPE}_{DATASET}",
+        experiment_name = f"VAE_{TYPE}_{DATASET}",
         config={
-            "architecture": "SAE",
+            "architecture": "VAE",
             "dataset": DATASET,
             "type": TYPE
         }
         )
-    model = Autoencoder().to(device)
+    model = VAE(latent_dim=128).to(device)
     weights = torch.load(MODEL_PATH, weights_only=False)
     model.load_state_dict(weights)
     model.eval()
@@ -228,13 +296,7 @@ def eval():
     if ATTACK_TYPE == "weather":
         attacked_dataset = UdacityImageAttackDataset(base_dir=ATTACK_DATA_ROOT, data=[ATTACK_DATA_TYPE], transform=transform)
 
-
     elif ATTACK_TYPE == "attack":
-        transform = transforms.Compose([
-            transforms.Resize((160, 320)),
-            transforms.ToTensor(),
-
-        ])
         attacked_dataset = AnomalImageDataset(ATTACKED_DATA, transform=transform)
     all_labels = []
     all_errors = []
@@ -246,13 +308,9 @@ def eval():
             x = x.to(device)
             y = y.to(device)
 
-            x_recon = model(x)
-
-            # Calculate reconstruction error per sample
-            errors = F.mse_loss(x_recon, x, reduction='none')
-            errors = errors.view(errors.size(0), -1).mean(dim=1)  # mean error per sample
-
-            all_errors.extend(errors.cpu().numpy())
+            outputs, mu, logvar = model(x)
+            loss = vae_loss_per_sample(outputs, x, mu, logvar)
+            all_errors.extend(loss.cpu().numpy())
             all_labels.extend(y.cpu().numpy())
     print("Evaluation Time ", time.time() - tic)
     # Stack all
@@ -339,5 +397,5 @@ if __name__ == "__main__":
         eval()
     else:
         train()
-    #get_threshold()
+    # get_threshold()
 
