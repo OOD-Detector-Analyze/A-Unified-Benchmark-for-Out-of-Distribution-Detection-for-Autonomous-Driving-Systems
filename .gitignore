@@ -1,0 +1,11 @@
+# Ignore everything
+*
+
+# But not these files...
+!.gitignore
+
+# Allow all Python files
+!*.py
+
+# If .py files are inside folders, allow the folders too
+!*/
